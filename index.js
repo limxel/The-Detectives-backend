@@ -2739,6 +2739,21 @@ io.on('connection', (socket) => {
         }
     });
 
+    // Lets a client measure the gap between its own system clock and the
+    // server's. Every countdown in this game (turn, trial, etc.) is sent to
+    // clients as an ABSOLUTE endsAt timestamp, and each client computes its
+    // own "remaining = endsAt - Date.now()" locally every tick. If a player's
+    // system clock is off from real time (wrong timezone, unsynced clock,
+    // VPN, etc.) that skew leaks straight into every one of those countdowns
+    // as extra or missing seconds — even though the server's own timers
+    // (setTimeout/setInterval) are completely accurate and unaffected.
+    // The client is expected to call this once on connect and periodically
+    // afterward, then add the resulting offset to its own Date.now() before
+    // comparing against any endsAt value. See serverTimeOffset on the client.
+    socket.on('time_sync', () => {
+        socket.emit('time_sync_response', { serverTime: Date.now() });
+    });
+
     // Client has loaded the black game screen after the fade-out. Once ALL players
     // in the room have loaded, roles are assigned and the intro text starts in
     // sync for everyone.
