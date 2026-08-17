@@ -3586,9 +3586,10 @@ io.on('connection', (socket) => {
     // investigateRoomUsedThisTurn) — Check Room is a way to log/share a room
     // you've already investigated, not a free substitute for investigating it.
     // Confirms whether the room the Innocent is currently standing in holds a
-    // code fragment, and if it genuinely doesn't, shares that with the rest of
-    // the Innocent team — anonymously: teammates only ever learn THAT a room
-    // was checked, never WHO checked it.
+    // code fragment, and either way shares with the rest of the Innocent team
+    // that the room was checked — anonymously: teammates only ever learn THAT
+    // a room was checked (and, separately, whether it's clean, for the green
+    // highlight), never WHO checked it.
     socket.on('check_room', ({ code, roomId }) => {
         const targetRoom = Object.values(rooms).find(r => r.code === code);
         if (!targetRoom || !targetRoom.game || targetRoom.game.phase !== 'action') {
@@ -3664,59 +3665,54 @@ io.on('connection', (socket) => {
 
         const roomInfo = findMansionRoomById(roomId);
         const fragment = targetRoom.evidenceLocations?.[roomId];
+        const cleared = !fragment;
 
-        if (fragment) {
+        if (cleared) {
+            // Genuinely no code fragment here — remember it as cleared so the
+            // green "already checked" highlight stays accurate for the team.
+            if (!targetRoom.innocentClearedRooms) targetRoom.innocentClearedRooms = {};
+            if (!targetRoom.innocentClearedRooms[roomId]) {
+                targetRoom.innocentClearedRooms[roomId] = { round: game.round };
+            }
+        } else {
             // A real code fragment IS here — never confirm it as clear, and
             // never reveal the digit through this ability. The Innocent still
             // spent their cooldown finding this out, same as a real search.
             console.log(`check_room: room=${targetRoom.code} INNOCENT ${socket.id} checked "${roomId}" — fragment present, NOT marked clear`);
-            socket.emit('check_room_result', {
-                code: targetRoom.code,
-                success: true,
-                cleared: false,
-                roomId,
-                roomName: roomInfo?.name || roomId,
-                turnsRemaining: MARK_ROOM_COOLDOWN_ROUNDS
-            });
-            return;
-        }
-
-        if (!targetRoom.innocentClearedRooms) targetRoom.innocentClearedRooms = {};
-        const alreadyKnown = Boolean(targetRoom.innocentClearedRooms[roomId]);
-        if (!alreadyKnown) {
-            targetRoom.innocentClearedRooms[roomId] = { round: game.round };
         }
 
         socket.emit('check_room_result', {
             code: targetRoom.code,
             success: true,
-            cleared: true,
+            cleared,
             roomId,
             roomName: roomInfo?.name || roomId,
             turnsRemaining: MARK_ROOM_COOLDOWN_ROUNDS
         });
 
-        // Anonymous team broadcast — every OTHER Innocent learns a room was
-        // confirmed clean, but never who confirmed it (the acting player
-        // already knows via their own 'check_room_result' above, so they're
-        // deliberately excluded here to avoid a redundant duplicate toast).
-        if (!alreadyKnown) {
-            let recipientCount = 0;
-            targetRoom.players.forEach(p => {
-                if (p.id === socket.id) return;
-                if (targetRoom.roles?.[p.id] === 'Innocent') {
-                    io.to(p.id).emit('room_marked_clean', {
-                        code: targetRoom.code,
-                        roomId,
-                        roomName: roomInfo?.name || roomId
-                    });
-                    recipientCount += 1;
-                }
-            });
-            console.log(`check_room: room=${targetRoom.code} INNOCENT ${socket.id} marked "${roomId}" as clean — shared anonymously with ${recipientCount} other Innocent(s)`);
-        } else {
-            console.log(`check_room: room=${targetRoom.code} INNOCENT ${socket.id} re-checked already-known-clean room "${roomId}"`);
-        }
+        // Anonymous team broadcast — every OTHER Innocent learns the room was
+        // checked, regardless of whether a code fragment was actually there
+        // — but never who checked it (the acting player already knows via
+        // their own 'check_room_result' above, so they're deliberately
+        // excluded here to avoid a redundant duplicate toast). `cleared` is
+        // still included so their client only lights up the green "clean"
+        // highlight when the room genuinely holds no fragment — the toast
+        // text itself stays the same generic "has been checked" either way,
+        // so this never leaks whether a fragment is actually present.
+        let recipientCount = 0;
+        targetRoom.players.forEach(p => {
+            if (p.id === socket.id) return;
+            if (targetRoom.roles?.[p.id] === 'Innocent') {
+                io.to(p.id).emit('room_marked_clean', {
+                    code: targetRoom.code,
+                    roomId,
+                    roomName: roomInfo?.name || roomId,
+                    cleared
+                });
+                recipientCount += 1;
+            }
+        });
+        console.log(`check_room: room=${targetRoom.code} INNOCENT ${socket.id} checked "${roomId}" (cleared=${cleared}) — shared anonymously with ${recipientCount} other Innocent(s)`);
     });
 
     // Player checks the room they've already entered this turn (see
