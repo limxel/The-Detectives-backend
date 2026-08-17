@@ -1993,6 +1993,23 @@ function checkKillerMajority(targetRoom) {
         });
         return true;
     }
+
+    // Win condition #3: the entire Killer team (Killer, plus Accomplice when
+    // in play) is no longer active in the match. In practice this almost
+    // always means they disconnected/left rather than being executed — a
+    // council execution already ends the match via the 'killer_executed'
+    // branch in resolveTrialPhase, so by the time we get here that path has
+    // already fired. With nobody left to hunt the peaceful team, there is
+    // nothing left to play for, so the win is handed to whichever peaceful
+    // agents remain, same as a correct execution of the Killer would give.
+    if (aliveKillerTeam === 0 && alivePeaceful > 0) {
+        endGameWithVictory(targetRoom, 'Innocent', {
+            reason: 'killer_team_disconnected',
+            message: 'The Killer is no longer in the match. The Innocents win!'
+        });
+        return true;
+    }
+
     return false;
 }
 
@@ -2115,6 +2132,9 @@ function startNewRound(targetRoom) {
     // see 'search_body' / 'investigate_room' for how this gets consumed and
     // 'select_room' / 'use_vent' for how entering a room re-arms it mid-turn.
     game.roomActionUsedThisTurn = {};
+    // See the 'investigateRoomUsedThisTurn' field comment in startGame — reset
+    // alongside roomActionUsedThisTurn for the same reason.
+    game.investigateRoomUsedThisTurn = {};
     // A Killer gets exactly one kill per turn — see 'kill_player' for the guard.
     // Unlike roomActionUsedThisTurn, this is NOT re-armed by entering a fresh
     // room (via 'select_room' or a vent hop): a Killer who kills, resolves the
@@ -2215,6 +2235,15 @@ function startGame(targetRoom) {
         // enters a fresh room (a new 'select_room', or a mid-turn 'use_vent' hop —
         // both clear this flag) or their next turn starts.
         roomActionUsedThisTurn: {},
+        // investigateRoomUsedThisTurn: playerId -> true once they've used
+        // 'investigate_room' on the room they're CURRENTLY standing in. Gates
+        // 'check_room' (Mark Room / "CHECK ROOM" button) below — an Innocent
+        // must actually investigate a room before they're allowed to mark it
+        // checked. Reset alongside roomActionUsedThisTurn: at the start of
+        // every round, and re-armed to false whenever a fresh room is entered
+        // (a new 'select_room' or a mid-turn 'use_vent' hop), since the
+        // requirement is per-room, not just once per turn.
+        investigateRoomUsedThisTurn: {},
         // killUsedThisTurn: playerId -> true once the Killer has landed a kill
         // this turn. A Killer gets exactly one kill per turn, no matter how many
         // rooms they pass through afterward (see 'kill_player'). Reset every
@@ -2477,6 +2506,9 @@ function handlePlayerLeftRoom(targetRoom, leavingSocketId) {
     if (targetRoom.game && targetRoom.game.roomActionUsedThisTurn) {
         delete targetRoom.game.roomActionUsedThisTurn[leavingSocketId];
     }
+    if (targetRoom.game && targetRoom.game.investigateRoomUsedThisTurn) {
+        delete targetRoom.game.investigateRoomUsedThisTurn[leavingSocketId];
+    }
     if (targetRoom.game && targetRoom.game.killUsedThisTurn) {
         delete targetRoom.game.killUsedThisTurn[leavingSocketId];
     }
@@ -2505,6 +2537,17 @@ function handlePlayerLeftRoom(targetRoom, leavingSocketId) {
         emitSpectatorRoomUpdates(targetRoom, pending.roomId);
         broadcastExitStatus(targetRoom);
         targetRoom.game.pendingKillDecision = null;
+    }
+
+    // A player leaving/disconnecting mid-match changes the surviving head
+    // count exactly like a kill or a council execution does — without this,
+    // a match could sit at (say) 1 Innocent vs 0 Killer, or 1 peaceful vs 1
+    // Killer, forever, never actually resolving, since nothing else ever
+    // re-runs this check outside of 'kill_player' and a trial's outcome.
+    // checkKillerMajority is a no-op (returns false) if there's no game yet
+    // or the match is already over, so this is always safe to call here.
+    if (targetRoom.game) {
+        checkKillerMajority(targetRoom);
     }
 }
 
@@ -2991,6 +3034,10 @@ io.on('connection', (socket) => {
         // 'search_body' / 'investigate_room'.
         if (!game.roomActionUsedThisTurn) game.roomActionUsedThisTurn = {};
         game.roomActionUsedThisTurn[socket.id] = false;
+        // A fresh room also re-locks 'check_room' until this room specifically
+        // gets investigated again — see the field comment in startGame.
+        if (!game.investigateRoomUsedThisTurn) game.investigateRoomUsedThisTurn = {};
+        game.investigateRoomUsedThisTurn[socket.id] = false;
         // A body left exposed in this room is "stumbled onto" the instant
         // someone walks in — same rule the CLUES board already applies to
         // evidence, just for bodies (see creditExposedBodyDiscovery). This is
@@ -3115,6 +3162,9 @@ io.on('connection', (socket) => {
         // player gets a brand-new room-interaction phase in the destination.
         if (!game.roomActionUsedThisTurn) game.roomActionUsedThisTurn = {};
         game.roomActionUsedThisTurn[socket.id] = false;
+        // Same re-lock as 'select_room' — see the field comment in startGame.
+        if (!game.investigateRoomUsedThisTurn) game.investigateRoomUsedThisTurn = {};
+        game.investigateRoomUsedThisTurn[socket.id] = false;
 
         if (creditExposedBodyDiscovery(targetRoom, destinationRoomId, player, game.round)) {
             broadcastExitStatus(targetRoom);
@@ -3466,6 +3516,10 @@ io.on('connection', (socket) => {
             return;
         }
         game.roomActionUsedThisTurn[socket.id] = true;
+        // Unlocks 'check_room' (Mark Room / "CHECK ROOM" button) for this room —
+        // see the field comment in startGame.
+        if (!game.investigateRoomUsedThisTurn) game.investigateRoomUsedThisTurn = {};
+        game.investigateRoomUsedThisTurn[socket.id] = true;
 
         const fragment = targetRoom.evidenceLocations?.[roomId];
         const role = targetRoom.roles ? targetRoom.roles[socket.id] : undefined;
@@ -3526,12 +3580,15 @@ io.on('connection', (socket) => {
 
     // Innocent's "CHECK ROOM" ability (Mark Room): a dedicated, cooldown-gated
     // action separate from 'investigate_room' above — doesn't touch
-    // roomActionUsedThisTurn, so it can be used alongside INVESTIGATE ROOM /
-    // SEARCH FOR BODY in the same turn, not instead of them. Confirms whether
-    // the room the Innocent is currently standing in holds a code fragment,
-    // and if it genuinely doesn't, shares that with the rest of the Innocent
-    // team — anonymously: teammates only ever learn THAT a room was checked,
-    // never WHO checked it.
+    // roomActionUsedThisTurn, so it can still be used after SEARCH FOR BODY in
+    // the same turn. It DOES, however, require 'investigate_room' to have
+    // already been used on this exact room first (see
+    // investigateRoomUsedThisTurn) — Check Room is a way to log/share a room
+    // you've already investigated, not a free substitute for investigating it.
+    // Confirms whether the room the Innocent is currently standing in holds a
+    // code fragment, and if it genuinely doesn't, shares that with the rest of
+    // the Innocent team — anonymously: teammates only ever learn THAT a room
+    // was checked, never WHO checked it.
     socket.on('check_room', ({ code, roomId }) => {
         const targetRoom = Object.values(rooms).find(r => r.code === code);
         if (!targetRoom || !targetRoom.game || targetRoom.game.phase !== 'action') {
@@ -3588,6 +3645,16 @@ io.on('connection', (socket) => {
                 success: false,
                 reason: 'cooldown',
                 turnsRemaining: status.turnsRemaining
+            });
+            return;
+        }
+
+        if (!game.investigateRoomUsedThisTurn || !game.investigateRoomUsedThisTurn[socket.id]) {
+            console.log(`check_room REJECTED: ${socket.id} has not investigated "${roomId}" yet this turn`);
+            socket.emit('check_room_result', {
+                code: targetRoom.code,
+                success: false,
+                reason: 'investigate_required'
             });
             return;
         }
