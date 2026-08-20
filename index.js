@@ -1981,10 +1981,21 @@ function isPeacefulRole(role) {
 }
 
 // --- ITEM: NEUROTOXIN-7 ------------------------------------------------
-// A single syringe planted once per match (see assignNeurotoxinLocation,
-// called from assignRoles) in a random searchable mansion room. Only
-// Killer / Accomplice / Joker may ever pick it up (see 'item:interact');
-// any other role is warned off and the syringe stays on the floor.
+// One or more syringes planted once per match (see assignNeurotoxinLocation,
+// called from assignRoles) in random searchable mansion rooms — how many
+// scales with the room's player count (see neurotoxinCountForPlayerCount).
+// There is no standalone pickup button: a syringe is discovered and
+// resolved automatically as part of 'investigate_room' — whoever searches
+// the room it's sitting in either picks it up or is told why they didn't
+// (wrong role, or already carrying one — see the blocker below), all as a
+// single popup instead of a plain toast (see the `neurotoxin` field
+// attached to 'investigate_result').
+//
+// Only Killer / Accomplice / Joker may ever carry it; any other role is
+// warned off and the syringe stays on the floor. A player may only ever
+// hold ONE unconsumed syringe at a time — this is the "blocker": finding a
+// second one while already carrying one leaves that second syringe exactly
+// where it is (see findNeurotoxinEntry's use inside 'investigate_room').
 //
 //   - Killer:            grants a second kill within the SAME round (this
 //                         game only ever gives a Killer one turn per round,
@@ -2037,6 +2048,13 @@ const NEUROTOXIN_MESSAGES = {
     shieldTriggered: {
         en: 'Neurotoxin auto-injected! Fatal blow was negated.',
         ru: 'Автоматическая инъекция Нейротоксина! Смертельный удар нейтрализован.'
+    },
+    // Blocker: this player is already carrying an unconsumed syringe, so a
+    // second one found in another room cannot be picked up — it's left
+    // exactly where it is for someone else.
+    alreadyCarrying: {
+        en: "There's another Neurotoxin-7 syringe here, but you're already carrying one — you can only hold a single dose at a time.",
+        ru: 'Здесь ещё один шприц с Нейротоксином-7, но у вас уже есть один — с собой можно нести только одну дозу.'
     }
 };
 
@@ -2062,15 +2080,41 @@ function killerMaxKillsThisTurn(killerPlayer) {
     return findNeurotoxinEntry(killerPlayer) ? NEUROTOXIN_REQUIRED_KILLS : 1;
 }
 
-// Plants the single Neurotoxin-7 syringe for the match in a random
-// searchable mansion room. Called once, right after roles are assigned
-// (see assignRoles) — guarded there so a stray re-entry can never move it
-// mid-match, same pattern as assignEvidenceLocations/digitalCode.
+// How many Neurotoxin-7 syringes are in play for the match, scaled to the
+// room's player count — bigger lobbies spread more copies around so a
+// single scramble for one item doesn't dominate a 10-12 player match:
+//   5-8 players  -> 1 syringe
+//   9-10 players -> 2 syringes
+//   11-12 players -> 3 syringes
+function neurotoxinCountForPlayerCount(playerCount) {
+    if (playerCount <= 8) return 1;
+    if (playerCount <= 10) return 2;
+    return 3;
+}
+
+// Plants this match's Neurotoxin-7 syringe(s) in distinct random searchable
+// mansion rooms — how many is decided by neurotoxinCountForPlayerCount.
+// Called once, right after roles are assigned (see assignRoles) — guarded
+// there so a stray re-entry can never re-roll them mid-match, same pattern
+// as assignEvidenceLocations/digitalCode.
 function assignNeurotoxinLocation(targetRoom) {
-    const candidates = allSearchableRoomIds();
-    const roomId = candidates[Math.floor(Math.random() * candidates.length)];
-    targetRoom.neurotoxinLocation = { itemId: NEUROTOXIN_ITEM_ID, roomId, pickedUp: false };
-    console.log(`Neurotoxin-7 planted for room ${targetRoom.code} in "${findMansionRoomById(roomId)?.name || roomId}"`);
+    const candidates = shuffleArray(allSearchableRoomIds());
+    const count = Math.min(neurotoxinCountForPlayerCount(targetRoom.players.length), candidates.length);
+    targetRoom.neurotoxinLocations = candidates.slice(0, count).map(roomId => ({
+        itemId: NEUROTOXIN_ITEM_ID,
+        roomId,
+        pickedUp: false
+    }));
+    const roomNames = targetRoom.neurotoxinLocations.map(loc => findMansionRoomById(loc.roomId)?.name || loc.roomId).join(', ');
+    console.log(`Neurotoxin-7: planted ${count} syringe(s) for room ${targetRoom.code} (${targetRoom.players.length} players) in: ${roomNames}`);
+}
+
+// Finds an unclaimed syringe sitting in a specific mansion room, if any —
+// used by 'investigate_room' to fold pickup into that action instead of a
+// separate button/event.
+function findNeurotoxinLocationInRoom(targetRoom, roomId) {
+    if (!Array.isArray(targetRoom.neurotoxinLocations)) return null;
+    return targetRoom.neurotoxinLocations.find(loc => loc.roomId === roomId && !loc.pickedUp) || null;
 }
 
 // Resolves Neurotoxin-7's passive shield for Accomplice/Joker. Call this
@@ -2541,7 +2585,7 @@ function assignRoles(targetRoom) {
     }
 
     // Same one-shot-per-match guard as evidenceLocations above.
-    if (!targetRoom.neurotoxinLocation) {
+    if (!targetRoom.neurotoxinLocations) {
         assignNeurotoxinLocation(targetRoom);
     }
 
@@ -3214,14 +3258,10 @@ io.on('connection', (socket) => {
             // exposedBodiesForRoom / 'resolve_kill').
             bodies: exposedBodiesForRoom(targetRoom, roomId),
             playerLocations: { ...game.playerLocations },
-            inspectMs: ROOM_INSPECT_MS,
-            // Lets the client show/hide the "pick up Neurotoxin-7" action —
-            // true only while the syringe is still sitting here, unclaimed.
-            neurotoxinPresent: Boolean(
-                targetRoom.neurotoxinLocation
-                && !targetRoom.neurotoxinLocation.pickedUp
-                && targetRoom.neurotoxinLocation.roomId === roomId
-            )
+            inspectMs: ROOM_INSPECT_MS
+            // Neurotoxin-7 is deliberately NOT surfaced here — same as
+            // evidence, it only ever shows up once the room is actually
+            // investigated (see 'investigate_room'), not just walked into.
         });
 
         // The turn stays active until the player explicitly ends it or the main
@@ -3351,95 +3391,6 @@ io.on('connection', (socket) => {
             playerLocations: { ...game.playerLocations },
             viaVent: true
         });
-    });
-
-    // Player attempts to pick up the Neurotoxin-7 syringe planted somewhere
-    // in the mansion (see assignNeurotoxinLocation). Only Killer / Accomplice
-    // / Joker may actually take it into their inventory — anyone else is
-    // told it's too hazardous to touch, and the syringe stays put.
-    socket.on('item:interact', ({ code, itemId }) => {
-        if (itemId !== NEUROTOXIN_ITEM_ID) return; // not our item
-
-        const targetRoom = Object.values(rooms).find(r => r.code === code);
-        if (!targetRoom || !targetRoom.game || targetRoom.game.phase !== 'action') {
-            console.log('item:interact IGNORED: no active action phase for room', code);
-            return;
-        }
-
-        const game = targetRoom.game;
-        const player = targetRoom.players.find(p => p.id === socket.id);
-        if (!player || player.isEliminated || player.isObserver) {
-            console.log('item:interact REJECTED: player eliminated, observing, or not found', socket.id);
-            return;
-        }
-
-        const location = targetRoom.neurotoxinLocation;
-        if (!location || location.pickedUp) {
-            console.log('item:interact IGNORED: Neurotoxin-7 already picked up or not planted', code);
-            return;
-        }
-
-        // Trust server-authoritative location, never whatever roomId the
-        // client happens to send.
-        const actualRoomId = game.playerLocations?.[socket.id];
-        if (!actualRoomId || actualRoomId !== location.roomId) {
-            console.log(`item:interact REJECTED: ${socket.id} is not standing in the syringe's room`);
-            return;
-        }
-
-        // Room Restrictions: NO Actions in Holding Cell.
-        if (isConfinedToHoldingCell(game, socket.id)) {
-            console.log(`item:interact REJECTED: ${socket.id} is confined to the Holding Cell this round`);
-            return;
-        }
-
-        if (isPlayerTrapDebuffed(game, socket.id)) {
-            rejectForTrapDebuff(targetRoom, socket, 'item:interact');
-            return;
-        }
-
-        const role = targetRoom.roles ? targetRoom.roles[socket.id] : undefined;
-
-        if (!NEUROTOXIN_ELIGIBLE_ROLES.includes(role)) {
-            // Wrong role: the syringe is not added to the inventory and
-            // stays exactly where it is on the map.
-            console.log(`item:interact REJECTED: ${socket.id} role=${role || 'unknown'} tried to pick up ${NEUROTOXIN_ITEM_ID}`);
-            socket.emit('item:interact:result', {
-                code: targetRoom.code,
-                itemId: NEUROTOXIN_ITEM_ID,
-                success: false,
-                reason: 'restricted_role',
-                message: NEUROTOXIN_MESSAGES.hazardous
-            });
-            return;
-        }
-
-        // Eligible role: move the item from the map into the inventory. It
-        // is kept indefinitely across rounds until its full-consumption
-        // conditions are met (see 'kill_player' / tryNeurotoxinShield).
-        location.pickedUp = true;
-        ensureInventory(player).push({
-            itemId: NEUROTOXIN_ITEM_ID,
-            definition: NEUROTOXIN_ITEM_DEFINITION,
-            acquiredRound: game.round,
-            // Only meaningful for a Killer; unused for the
-            // Accomplice/Joker passive-shield behavior.
-            killsInCurrentRound: 0
-        });
-
-        const message = role === 'Killer' ? NEUROTOXIN_MESSAGES.pickedUpKiller : NEUROTOXIN_MESSAGES.pickedUpShield;
-
-        console.log(`item:interact: room=${targetRoom.code} ${role} ${socket.id} picked up ${NEUROTOXIN_ITEM_ID}`);
-
-        socket.emit('item:interact:result', {
-            code: targetRoom.code,
-            itemId: NEUROTOXIN_ITEM_ID,
-            success: true,
-            message
-        });
-
-        // Let everyone else in the room know the syringe is gone from the map.
-        socket.to(targetRoom.id).emit('map:item_removed', { code: targetRoom.code, itemId: NEUROTOXIN_ITEM_ID });
     });
 
     // Killer-only: eliminates another active player standing in the SAME
@@ -3829,8 +3780,52 @@ io.on('connection', (socket) => {
             io.to(targetRoom.id).emit('clues_board_update', { code: targetRoom.code, clues: buildCluesBoard(targetRoom) });
         }
 
+        // --- NEUROTOXIN-7: folded into 'investigate_room' ------------------
+        // No standalone pickup button any more — if this room still has an
+        // unclaimed syringe, investigating it resolves the pickup (or the
+        // reason it didn't happen) right here, attached to this same result
+        // as `neurotoxin` so the client can pop up a dedicated notification
+        // instead of a plain toast. Only ever attached to the actual
+        // searcher's own result — never shared with Innocent teammates below,
+        // same as planted evidence.
+        let neurotoxinResult = null;
+        const neurotoxinLocation = findNeurotoxinLocationInRoom(targetRoom, roomId);
+        if (neurotoxinLocation) {
+            if (!NEUROTOXIN_ELIGIBLE_ROLES.includes(role)) {
+                // Wrong role: the syringe is not added to the inventory and
+                // stays exactly where it is on the map.
+                neurotoxinResult = { outcome: 'restricted_role', message: NEUROTOXIN_MESSAGES.hazardous };
+                console.log(`investigate_room: room=${targetRoom.code} role=${role || 'unknown'} ${socket.id} found Neurotoxin-7 in "${roomId}" but cannot touch it`);
+            } else if (findNeurotoxinEntry(player)) {
+                // Blocker: this player already carries an unconsumed syringe —
+                // only one may ever be held at a time, so this one is left
+                // exactly where it is for someone else to find later.
+                neurotoxinResult = { outcome: 'already_carrying', message: NEUROTOXIN_MESSAGES.alreadyCarrying };
+                console.log(`investigate_room: room=${targetRoom.code} ${role} ${socket.id} found a second Neurotoxin-7 in "${roomId}" but is already carrying one — left in place`);
+            } else {
+                // Eligible role, no syringe currently held: move it from the
+                // map into the inventory. It is kept indefinitely across
+                // rounds until its full-consumption conditions are met (see
+                // 'kill_player' / tryNeurotoxinShield).
+                neurotoxinLocation.pickedUp = true;
+                ensureInventory(player).push({
+                    itemId: NEUROTOXIN_ITEM_ID,
+                    definition: NEUROTOXIN_ITEM_DEFINITION,
+                    acquiredRound: game.round,
+                    // Only meaningful for a Killer; unused for the
+                    // Accomplice/Joker passive-shield behavior.
+                    killsInCurrentRound: 0
+                });
+                const message = role === 'Killer' ? NEUROTOXIN_MESSAGES.pickedUpKiller : NEUROTOXIN_MESSAGES.pickedUpShield;
+                neurotoxinResult = { outcome: 'picked_up', message, effect: role === 'Killer' ? 'double_kill' : 'shield' };
+                console.log(`investigate_room: room=${targetRoom.code} ${role} ${socket.id} picked up Neurotoxin-7 in "${roomId}"`);
+                // Let everyone else in the room know this syringe is gone from the map.
+                socket.to(targetRoom.id).emit('map:item_removed', { code: targetRoom.code, itemId: NEUROTOXIN_ITEM_ID, roomId });
+            }
+        }
+
         if (!fragment) {
-            socket.emit('investigate_result', { code: targetRoom.code, roomId, type: 'empty', evidence });
+            socket.emit('investigate_result', { code: targetRoom.code, roomId, type: 'empty', evidence, neurotoxin: neurotoxinResult });
             console.log(`investigate_room: room=${targetRoom.code} player=${socket.id} found nothing in "${roomId}"`);
             return;
         }
@@ -3841,7 +3836,10 @@ io.on('connection', (socket) => {
             // individually to each Innocent's own socket, so no other role ever
             // sees this broadcast. Planted evidence, however, is NOT team
             // knowledge — it's only attached to the actual searcher's own
-            // result, same as for every other role.
+            // result, same as for every other role. Neurotoxin-7 can never
+            // apply to an Innocent (see NEUROTOXIN_ELIGIBLE_ROLES) so
+            // `neurotoxinResult` here is always null, but it's still only
+            // ever attached to the searcher's own payload for consistency.
             const payload = {
                 code: targetRoom.code,
                 roomId,
@@ -3856,7 +3854,7 @@ io.on('connection', (socket) => {
             targetRoom.players.forEach(p => {
                 if (targetRoom.roles?.[p.id] === 'Innocent') {
                     const isSelf = p.id === socket.id;
-                    io.to(p.id).emit('investigate_result', { ...payload, selfFound: isSelf, ...(isSelf ? { evidence } : {}) });
+                    io.to(p.id).emit('investigate_result', { ...payload, selfFound: isSelf, ...(isSelf ? { evidence, neurotoxin: neurotoxinResult } : {}) });
                     recipientCount += 1;
                 }
             });
@@ -3864,7 +3862,7 @@ io.on('connection', (socket) => {
         } else {
             // Digit is deliberately withheld — this branch never touches
             // fragment.digit, so no code information can leak to this role.
-            socket.emit('investigate_result', { code: targetRoom.code, roomId, type: 'trash', evidence });
+            socket.emit('investigate_result', { code: targetRoom.code, roomId, type: 'trash', evidence, neurotoxin: neurotoxinResult });
             console.log(`investigate_room: room=${targetRoom.code} role=${role || 'unknown'} ${socket.id} found trash in "${roomId}" (fragment withheld)`);
         }
     });
