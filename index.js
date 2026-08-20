@@ -1808,7 +1808,25 @@ function resolveTrialPhase(targetRoom) {
     if (winnerEntry && highestPlayerVotes > 0 && !hasTiedTopPlayers && !skipWinsOrTies) {
         const targetId = winnerEntry[0];
         const targetPlayer = targetRoom.players.find(player => player.id === targetId);
-        if (targetPlayer && !targetPlayer.isEliminated) {
+        // --- NEUROTOXIN-7: passive shield check (Accomplice/Joker) --------
+        // A council execution is a fatal hit just like a Killer's attack —
+        // an unconsumed shield negates it here too, before anything else
+        // about the execution is decided.
+        if (targetPlayer && !targetPlayer.isEliminated && tryNeurotoxinShield(targetRoom, targetPlayer)) {
+            outcome = {
+                executed: false,
+                targetId: null,
+                targetName: null,
+                voteSummary,
+                voteBreakdown,
+                isSkipped: true,
+                eliminatedPlayer: null,
+                candidates,
+                eligibleVoterIds,
+                message: `${targetPlayer.nickname}'s fatal blow was negated by Neurotoxin-7.`
+            };
+            console.log(`Room ${targetRoom.code}: ${targetPlayer.nickname}'s trial execution was NEGATED by a Neurotoxin-7 shield`);
+        } else if (targetPlayer && !targetPlayer.isEliminated) {
             targetPlayer.isEliminated = true;
             targetPlayer.isObserver = true;
 
@@ -1960,6 +1978,126 @@ function isKillerTeamRole(role) {
 
 function isPeacefulRole(role) {
     return Boolean(role) && !KILLER_TEAM_ROLES.includes(role) && role !== 'Joker';
+}
+
+// --- ITEM: NEUROTOXIN-7 ------------------------------------------------
+// A single syringe planted once per match (see assignNeurotoxinLocation,
+// called from assignRoles) in a random searchable mansion room. Only
+// Killer / Accomplice / Joker may ever pick it up (see 'item:interact');
+// any other role is warned off and the syringe stays on the floor.
+//
+//   - Killer:            grants a second kill within the SAME round (this
+//                         game only ever gives a Killer one turn per round,
+//                         so "within a round" and "within that turn" are
+//                         the same window here — see 'kill_player'). The
+//                         item is consumed only once the 2nd kill lands
+//                         that round; a round with just 1 kill keeps it.
+//   - Accomplice / Joker: a one-time passive shield. The next time this
+//                         player would be eliminated (a Killer's attack OR
+//                         a council execution), the elimination is negated
+//                         instead and the item is consumed.
+//
+// All player-facing text is sent as an { en, ru } pair so the client can
+// pick whichever matches its own active `language` state.
+const NEUROTOXIN_ITEM_ID = 'item_neurotoxin';
+
+const NEUROTOXIN_ITEM_DEFINITION = {
+    id: NEUROTOXIN_ITEM_ID,
+    name: { en: 'Neurotoxin-7', ru: 'Нейротоксин-7' },
+    type: 'consumable'
+};
+
+// Only these three roles may ever carry Neurotoxin-7.
+const NEUROTOXIN_ELIGIBLE_ROLES = ['Killer', 'Accomplice', 'Joker'];
+
+// Kills needed within a single round before the item is consumed for a Killer.
+const NEUROTOXIN_REQUIRED_KILLS = 2;
+
+const NEUROTOXIN_MESSAGES = {
+    hazardous: {
+        en: 'The syringe contains an unknown dangerous compound — it is too hazardous to touch.',
+        ru: 'Шприц содержит неизвестный ядовитый состав — без спецзащиты прикосновение смертельно опасно.'
+    },
+    pickedUpKiller: {
+        en: 'You picked up Neurotoxin-7. Allows 2 kills in a single round.',
+        ru: 'Вы подняли Нейротоксин-7. Позволяет совершить 2 убийства за один раунд.'
+    },
+    pickedUpShield: {
+        en: 'You picked up Neurotoxin-7. Acts as a passive shield against fatal damage.',
+        ru: 'Вы подняли Нейротоксин-7. Работает как пассивный щит от смертельного урона.'
+    },
+    firstKill: {
+        en: 'First kill in this round executed. Second kill available!',
+        ru: 'Первое убийство в этом раунде совершено. Доступно второе убийство!'
+    },
+    doubleKill: {
+        en: 'Double kill executed! Neurotoxin consumed.',
+        ru: 'Двойное убийство совершено! Нейротоксин израсходован.'
+    },
+    shieldTriggered: {
+        en: 'Neurotoxin auto-injected! Fatal blow was negated.',
+        ru: 'Автоматическая инъекция Нейротоксина! Смертельный удар нейтрализован.'
+    }
+};
+
+function ensureInventory(player) {
+    if (!Array.isArray(player.inventory)) player.inventory = [];
+    return player.inventory;
+}
+
+function findNeurotoxinEntry(player) {
+    if (!player) return null;
+    return ensureInventory(player).find(entry => entry.itemId === NEUROTOXIN_ITEM_ID) || null;
+}
+
+function removeNeurotoxinEntry(player) {
+    const inventory = ensureInventory(player);
+    const idx = inventory.findIndex(entry => entry.itemId === NEUROTOXIN_ITEM_ID);
+    if (idx !== -1) inventory.splice(idx, 1);
+}
+
+// How many kills a Killer may make THIS turn — 2 while carrying an
+// unconsumed Neurotoxin-7, otherwise the normal 1.
+function killerMaxKillsThisTurn(killerPlayer) {
+    return findNeurotoxinEntry(killerPlayer) ? NEUROTOXIN_REQUIRED_KILLS : 1;
+}
+
+// Plants the single Neurotoxin-7 syringe for the match in a random
+// searchable mansion room. Called once, right after roles are assigned
+// (see assignRoles) — guarded there so a stray re-entry can never move it
+// mid-match, same pattern as assignEvidenceLocations/digitalCode.
+function assignNeurotoxinLocation(targetRoom) {
+    const candidates = allSearchableRoomIds();
+    const roomId = candidates[Math.floor(Math.random() * candidates.length)];
+    targetRoom.neurotoxinLocation = { itemId: NEUROTOXIN_ITEM_ID, roomId, pickedUp: false };
+    console.log(`Neurotoxin-7 planted for room ${targetRoom.code} in "${findMansionRoomById(roomId)?.name || roomId}"`);
+}
+
+// Resolves Neurotoxin-7's passive shield for Accomplice/Joker. Call this
+// BEFORE marking a target eliminated, from every place a player can be
+// fatally hit (a Killer's attack — see 'kill_player' — and a council
+// execution — see resolveTrialPhase).
+//
+// Returns true  -> the hit was negated, item consumed, do NOT eliminate.
+// Returns false -> no shield available, proceed with the elimination.
+function tryNeurotoxinShield(targetRoom, victimPlayer) {
+    const role = targetRoom.roles ? targetRoom.roles[victimPlayer.id] : undefined;
+    if (role !== 'Accomplice' && role !== 'Joker') return false;
+
+    const entry = findNeurotoxinEntry(victimPlayer);
+    if (!entry) return false;
+
+    removeNeurotoxinEntry(victimPlayer);
+
+    console.log(`Neurotoxin-7: room=${targetRoom.code} ${role} ${victimPlayer.id} shield triggered — item consumed`);
+
+    io.to(victimPlayer.id).emit('player:takeFatalHit:result', {
+        code: targetRoom.code,
+        negated: true,
+        message: NEUROTOXIN_MESSAGES.shieldTriggered
+    });
+
+    return true;
 }
 
 // Win condition #1: the moment the number of still-active peaceful players
@@ -2141,6 +2279,17 @@ function startNewRound(targetRoom) {
     // body, and then walks/vents into a room with another potential victim
     // must not be able to kill again until their NEXT turn.
     game.killUsedThisTurn = {};
+
+    // --- NEUROTOXIN-7: reset the per-round kill counter --------------------
+    // Only reaching 2 kills WITHIN a round consumes the item (see
+    // 'kill_player') — a Killer who landed just 1 kill last round keeps it
+    // going into this new round, so the item itself is deliberately left
+    // untouched here.
+    targetRoom.players.forEach(player => {
+        const entry = findNeurotoxinEntry(player);
+        if (entry) entry.killsInCurrentRound = 0;
+    });
+
     // A kill's post-kill body decision (see 'kill_player' / 'resolve_kill') must
     // always be settled before its own turn ends (advanceTurn auto-resolves it
     // to "expose" if not) — never something a Killer carries into a new round.
@@ -2391,6 +2540,11 @@ function assignRoles(targetRoom) {
         assignEvidenceLocations(targetRoom);
     }
 
+    // Same one-shot-per-match guard as evidenceLocations above.
+    if (!targetRoom.neurotoxinLocation) {
+        assignNeurotoxinLocation(targetRoom);
+    }
+
     targetRoom.players.forEach(player => {
         io.to(player.id).emit('role_assigned', { role: targetRoom.roles[player.id] });
     });
@@ -2604,7 +2758,7 @@ io.on('connection', (socket) => {
             type: type,
             hostId: socket.id,
             status: 'open', // 'open' -> can join | 'preparing' -> join locked, preparation/game in progress
-            players: [{ id: socket.id, nickname: nickname || 'Agent', character: null, isReady: false, isEliminated: false, isObserver: false }],
+            players: [{ id: socket.id, nickname: nickname || 'Agent', character: null, isReady: false, isEliminated: false, isObserver: false, inventory: [] }],
             loadedPlayers: [],
             skipVotes: [],
             introStarted: false,
@@ -2658,7 +2812,7 @@ io.on('connection', (socket) => {
                     return;
                 }
 
-                targetRoom.players.push({ id: socket.id, nickname: nickname || 'Agent', character: null, isReady: false, isEliminated: false, isObserver: false });
+                targetRoom.players.push({ id: socket.id, nickname: nickname || 'Agent', character: null, isReady: false, isEliminated: false, isObserver: false, inventory: [] });
             }
 
             socket.join(targetRoom.id);
@@ -3060,7 +3214,14 @@ io.on('connection', (socket) => {
             // exposedBodiesForRoom / 'resolve_kill').
             bodies: exposedBodiesForRoom(targetRoom, roomId),
             playerLocations: { ...game.playerLocations },
-            inspectMs: ROOM_INSPECT_MS
+            inspectMs: ROOM_INSPECT_MS,
+            // Lets the client show/hide the "pick up Neurotoxin-7" action —
+            // true only while the syringe is still sitting here, unclaimed.
+            neurotoxinPresent: Boolean(
+                targetRoom.neurotoxinLocation
+                && !targetRoom.neurotoxinLocation.pickedUp
+                && targetRoom.neurotoxinLocation.roomId === roomId
+            )
         });
 
         // The turn stays active until the player explicitly ends it or the main
@@ -3192,6 +3353,95 @@ io.on('connection', (socket) => {
         });
     });
 
+    // Player attempts to pick up the Neurotoxin-7 syringe planted somewhere
+    // in the mansion (see assignNeurotoxinLocation). Only Killer / Accomplice
+    // / Joker may actually take it into their inventory — anyone else is
+    // told it's too hazardous to touch, and the syringe stays put.
+    socket.on('item:interact', ({ code, itemId }) => {
+        if (itemId !== NEUROTOXIN_ITEM_ID) return; // not our item
+
+        const targetRoom = Object.values(rooms).find(r => r.code === code);
+        if (!targetRoom || !targetRoom.game || targetRoom.game.phase !== 'action') {
+            console.log('item:interact IGNORED: no active action phase for room', code);
+            return;
+        }
+
+        const game = targetRoom.game;
+        const player = targetRoom.players.find(p => p.id === socket.id);
+        if (!player || player.isEliminated || player.isObserver) {
+            console.log('item:interact REJECTED: player eliminated, observing, or not found', socket.id);
+            return;
+        }
+
+        const location = targetRoom.neurotoxinLocation;
+        if (!location || location.pickedUp) {
+            console.log('item:interact IGNORED: Neurotoxin-7 already picked up or not planted', code);
+            return;
+        }
+
+        // Trust server-authoritative location, never whatever roomId the
+        // client happens to send.
+        const actualRoomId = game.playerLocations?.[socket.id];
+        if (!actualRoomId || actualRoomId !== location.roomId) {
+            console.log(`item:interact REJECTED: ${socket.id} is not standing in the syringe's room`);
+            return;
+        }
+
+        // Room Restrictions: NO Actions in Holding Cell.
+        if (isConfinedToHoldingCell(game, socket.id)) {
+            console.log(`item:interact REJECTED: ${socket.id} is confined to the Holding Cell this round`);
+            return;
+        }
+
+        if (isPlayerTrapDebuffed(game, socket.id)) {
+            rejectForTrapDebuff(targetRoom, socket, 'item:interact');
+            return;
+        }
+
+        const role = targetRoom.roles ? targetRoom.roles[socket.id] : undefined;
+
+        if (!NEUROTOXIN_ELIGIBLE_ROLES.includes(role)) {
+            // Wrong role: the syringe is not added to the inventory and
+            // stays exactly where it is on the map.
+            console.log(`item:interact REJECTED: ${socket.id} role=${role || 'unknown'} tried to pick up ${NEUROTOXIN_ITEM_ID}`);
+            socket.emit('item:interact:result', {
+                code: targetRoom.code,
+                itemId: NEUROTOXIN_ITEM_ID,
+                success: false,
+                reason: 'restricted_role',
+                message: NEUROTOXIN_MESSAGES.hazardous
+            });
+            return;
+        }
+
+        // Eligible role: move the item from the map into the inventory. It
+        // is kept indefinitely across rounds until its full-consumption
+        // conditions are met (see 'kill_player' / tryNeurotoxinShield).
+        location.pickedUp = true;
+        ensureInventory(player).push({
+            itemId: NEUROTOXIN_ITEM_ID,
+            definition: NEUROTOXIN_ITEM_DEFINITION,
+            acquiredRound: game.round,
+            // Only meaningful for a Killer; unused for the
+            // Accomplice/Joker passive-shield behavior.
+            killsInCurrentRound: 0
+        });
+
+        const message = role === 'Killer' ? NEUROTOXIN_MESSAGES.pickedUpKiller : NEUROTOXIN_MESSAGES.pickedUpShield;
+
+        console.log(`item:interact: room=${targetRoom.code} ${role} ${socket.id} picked up ${NEUROTOXIN_ITEM_ID}`);
+
+        socket.emit('item:interact:result', {
+            code: targetRoom.code,
+            itemId: NEUROTOXIN_ITEM_ID,
+            success: true,
+            message
+        });
+
+        // Let everyone else in the room know the syringe is gone from the map.
+        socket.to(targetRoom.id).emit('map:item_removed', { code: targetRoom.code, itemId: NEUROTOXIN_ITEM_ID });
+    });
+
     // Killer-only: eliminates another active player standing in the SAME
     // mansion room this turn. This is the kill itself — the victim is
     // eliminated the instant it lands. It does NOT by itself decide what
@@ -3230,8 +3480,13 @@ io.on('connection', (socket) => {
             return;
         }
 
-        if (game.killUsedThisTurn?.[socket.id]) {
-            console.log(`kill_player REJECTED: ${socket.id} already used their one kill this turn`);
+        // Normally a Killer gets exactly 1 kill per turn. Carrying an
+        // unconsumed Neurotoxin-7 raises that to 2 within the same round
+        // (this game gives a Killer only one turn per round, so "this
+        // round" and "this turn" are the same window here).
+        const killsSoFarThisTurn = game.killUsedThisTurn?.[socket.id] || 0;
+        if (killsSoFarThisTurn >= killerMaxKillsThisTurn(killer)) {
+            console.log(`kill_player REJECTED: ${socket.id} already used their kill(s) this turn`);
             return;
         }
 
@@ -3268,12 +3523,47 @@ io.on('connection', (socket) => {
             return;
         }
 
+        // --- NEUROTOXIN-7: passive shield check (Accomplice/Joker) --------
+        // If the target is carrying an unconsumed Neurotoxin-7, the attack
+        // is negated here: no elimination, no body, no pending decision.
+        // Only the Killer is told why (the shield trigger itself is
+        // reported privately to the victim inside tryNeurotoxinShield).
+        if (tryNeurotoxinShield(targetRoom, target)) {
+            if (!game.killUsedThisTurn) game.killUsedThisTurn = {};
+            game.killUsedThisTurn[socket.id] = killsSoFarThisTurn + 1;
+            console.log(`kill_player: room=${targetRoom.code} KILLER ${socket.id} attack on ${target.nickname} was NEGATED by a Neurotoxin-7 shield`);
+            socket.emit('kill_options', {
+                code: targetRoom.code,
+                negatedByShield: true,
+                targetId,
+                targetNickname: target.nickname
+            });
+            return;
+        }
+
         // The kill lands immediately.
         target.isEliminated = true;
         target.isObserver = true;
 
         if (!game.killUsedThisTurn) game.killUsedThisTurn = {};
-        game.killUsedThisTurn[socket.id] = true;
+        game.killUsedThisTurn[socket.id] = killsSoFarThisTurn + 1;
+
+        // --- NEUROTOXIN-7: Killer-side effect ------------------------------
+        // Tracks the double-kill window and consumes the item once 2 kills
+        // have landed within this round (see also startNewRound, which
+        // resets this counter for a Killer who only got 1 kill last round).
+        let neurotoxinMessage = null;
+        const neurotoxinEntry = findNeurotoxinEntry(killer);
+        if (neurotoxinEntry) {
+            neurotoxinEntry.killsInCurrentRound += 1;
+            if (neurotoxinEntry.killsInCurrentRound >= NEUROTOXIN_REQUIRED_KILLS) {
+                removeNeurotoxinEntry(killer);
+                neurotoxinMessage = NEUROTOXIN_MESSAGES.doubleKill;
+                console.log(`kill_player: room=${targetRoom.code} KILLER ${socket.id} double kill this round — Neurotoxin-7 consumed`);
+            } else {
+                neurotoxinMessage = NEUROTOXIN_MESSAGES.firstKill;
+            }
+        }
 
         // Drop the victim from the raw occupancy ledger too — activeRoomOccupants
         // already filters eliminated players out, but a stale entry here could
@@ -3321,7 +3611,8 @@ io.on('connection', (socket) => {
             targetId,
             targetNickname: target.nickname,
             targetCharacter: target.character,
-            roomId: killerRoomId
+            roomId: killerRoomId,
+            neurotoxinMessage
         });
     });
 
