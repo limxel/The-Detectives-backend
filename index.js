@@ -2211,6 +2211,14 @@ function resetRoomToLobby(targetRoom) {
     targetRoom.roles = {};
     targetRoom.digitalCode = null;
     targetRoom.evidenceLocations = null;
+    // BUGFIX: this was missing, so the one-shot-per-match guard in
+    // assignRoles (`if (!targetRoom.neurotoxinLocations)`) saw last match's
+    // array still sitting here and skipped planting new syringes entirely —
+    // Neurotoxin-7 would only ever appear in the very first match a room
+    // played, never in any rematch. Clearing it here is what makes a fresh
+    // assignNeurotoxinLocation() run for every new match, same as
+    // evidenceLocations above.
+    targetRoom.neurotoxinLocations = null;
     targetRoom.innocentClearedRooms = null;
     targetRoom.plantedEvidence = null;
     targetRoom.traps = null;
