@@ -1808,25 +1808,14 @@ function resolveTrialPhase(targetRoom) {
     if (winnerEntry && highestPlayerVotes > 0 && !hasTiedTopPlayers && !skipWinsOrTies) {
         const targetId = winnerEntry[0];
         const targetPlayer = targetRoom.players.find(player => player.id === targetId);
-        // --- NEUROTOXIN-7: passive shield check (Accomplice/Joker) --------
-        // A council execution is a fatal hit just like a Killer's attack —
-        // an unconsumed shield negates it here too, before anything else
-        // about the execution is decided.
-        if (targetPlayer && !targetPlayer.isEliminated && tryNeurotoxinShield(targetRoom, targetPlayer)) {
-            outcome = {
-                executed: false,
-                targetId: null,
-                targetName: null,
-                voteSummary,
-                voteBreakdown,
-                isSkipped: true,
-                eliminatedPlayer: null,
-                candidates,
-                eligibleVoterIds,
-                message: `${targetPlayer.nickname}'s fatal blow was negated by Neurotoxin-7.`
-            };
-            console.log(`Room ${targetRoom.code}: ${targetPlayer.nickname}'s trial execution was NEGATED by a Neurotoxin-7 shield`);
-        } else if (targetPlayer && !targetPlayer.isEliminated) {
+        // --- NEUROTOXIN-7: deliberately NOT checked here -------------------
+        // The passive shield only negates a Killer's direct attack (see
+        // 'kill_player'). Being voted out by the council is NOT a "fatal
+        // blow" in that sense — Neurotoxin-7 grants no immunity from
+        // elimination by vote, so a carried/unconsumed syringe is left
+        // completely untouched by an execution and the player is eliminated
+        // normally below.
+        if (targetPlayer && !targetPlayer.isEliminated) {
             targetPlayer.isEliminated = true;
             targetPlayer.isObserver = true;
 
@@ -2083,11 +2072,11 @@ function killerMaxKillsThisTurn(killerPlayer) {
 // How many Neurotoxin-7 syringes are in play for the match, scaled to the
 // room's player count — bigger lobbies spread more copies around so a
 // single scramble for one item doesn't dominate a 10-12 player match:
-//   5-8 players  -> 1 syringe
-//   9-10 players -> 2 syringes
+//   5-7 players  -> 1 syringe
+//   8-10 players -> 2 syringes
 //   11-12 players -> 3 syringes
 function neurotoxinCountForPlayerCount(playerCount) {
-    if (playerCount <= 8) return 1;
+    if (playerCount <= 7) return 1;
     if (playerCount <= 10) return 2;
     return 3;
 }
@@ -2118,9 +2107,10 @@ function findNeurotoxinLocationInRoom(targetRoom, roomId) {
 }
 
 // Resolves Neurotoxin-7's passive shield for Accomplice/Joker. Call this
-// BEFORE marking a target eliminated, from every place a player can be
-// fatally hit (a Killer's attack — see 'kill_player' — and a council
-// execution — see resolveTrialPhase).
+// BEFORE marking a target eliminated by a Killer's direct attack (see
+// 'kill_player'). Deliberately NOT used for a council/vote execution —
+// Neurotoxin-7 grants no immunity from being voted out (see
+// resolveTrialPhase, which eliminates on a winning vote unconditionally).
 //
 // Returns true  -> the hit was negated, item consumed, do NOT eliminate.
 // Returns false -> no shield available, proceed with the elimination.
@@ -3487,10 +3477,18 @@ io.on('connection', (socket) => {
         // is negated here: no elimination, no body, no pending decision.
         // Only the Killer is told why (the shield trigger itself is
         // reported privately to the victim inside tryNeurotoxinShield).
+        //
+        // A failed/shielded attempt costs the Killer their ENTIRE round —
+        // not just a single kill charge. So instead of bumping the counter
+        // by 1 (which, with the Killer's own unconsumed Neurotoxin-7, would
+        // still leave a second attempt available this turn), the counter is
+        // pinned to a value no killerMaxKillsThisTurn() can ever clear,
+        // permanently failing the `killsSoFarThisTurn >= ...` gate above for
+        // the rest of this round.
         if (tryNeurotoxinShield(targetRoom, target)) {
             if (!game.killUsedThisTurn) game.killUsedThisTurn = {};
-            game.killUsedThisTurn[socket.id] = killsSoFarThisTurn + 1;
-            console.log(`kill_player: room=${targetRoom.code} KILLER ${socket.id} attack on ${target.nickname} was NEGATED by a Neurotoxin-7 shield`);
+            game.killUsedThisTurn[socket.id] = Infinity;
+            console.log(`kill_player: room=${targetRoom.code} KILLER ${socket.id} attack on ${target.nickname} was NEGATED by a Neurotoxin-7 shield — killer locked out of killing for the rest of this round`);
             socket.emit('kill_options', {
                 code: targetRoom.code,
                 negatedByShield: true,
