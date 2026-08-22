@@ -449,19 +449,19 @@ function forensicAbilityStatusPayload(targetRoom, playerId) {
     const game = targetRoom?.game;
     const lastUsed = game?.forensicAbilityLastUsedRound?.[playerId];
     if (lastUsed == null) {
-        return { code: targetRoom.code, available: true, turnsRemaining: 0 };
+        return { code: targetRoom.code, available: true, roundsRemaining: 0 };
     }
 
     const roundsSinceUse = game.round - lastUsed;
     const available = roundsSinceUse > FORENSIC_SHARED_COOLDOWN_ROUNDS;
-    const turnsRemaining = available
+    const roundsRemaining = available
         ? 0
         : Math.max(1, (FORENSIC_SHARED_COOLDOWN_ROUNDS + 1) - roundsSinceUse);
 
     return {
         code: targetRoom.code,
         available,
-        turnsRemaining
+        roundsRemaining
     };
 }
 
@@ -4170,13 +4170,13 @@ io.on('connection', (socket) => {
 
         if (!isForensicAbilityAvailable(game, socket.id, game.round)) {
             const lastUsed = game.forensicAbilityLastUsedRound?.[socket.id];
-            const turnsRemaining = lastUsed == null ? 0 : (FORENSIC_SHARED_COOLDOWN_ROUNDS + 1) - (game.round - lastUsed);
+            const roundsRemaining = lastUsed == null ? 0 : (FORENSIC_SHARED_COOLDOWN_ROUNDS + 1) - (game.round - lastUsed);
             console.log(`verify_evidence REJECTED: ${socket.id} on shared Forensic cooldown`);
             socket.emit('verify_evidence_result', {
                 code: targetRoom.code,
                 success: false,
                 reason: 'cooldown',
-                turnsRemaining: Math.max(0, turnsRemaining)
+                roundsRemaining: Math.max(0, roundsRemaining)
             });
             emitForensicAbilityStatus(targetRoom, socket.id);
             return;
@@ -4201,7 +4201,7 @@ io.on('connection', (socket) => {
             evidenceId: evidenceEntry.id,
             text: evidenceEntry.text,
             isAuthentic,
-            turnsRemaining: FORENSIC_SHARED_COOLDOWN_ROUNDS + 1
+            roundsRemaining: FORENSIC_SHARED_COOLDOWN_ROUNDS + 1
         });
     });
 
@@ -4287,13 +4287,13 @@ io.on('connection', (socket) => {
 
         if (!isForensicAbilityAvailable(game, socket.id, game.round)) {
             const lastUsed = game.forensicAbilityLastUsedRound?.[socket.id];
-            const turnsRemaining = lastUsed == null ? 0 : (FORENSIC_SHARED_COOLDOWN_ROUNDS + 1) - (game.round - lastUsed);
+            const roundsRemaining = lastUsed == null ? 0 : (FORENSIC_SHARED_COOLDOWN_ROUNDS + 1) - (game.round - lastUsed);
             console.log(`examine_body REJECTED: ${socket.id} on shared Forensic cooldown`);
             socket.emit('examine_body_result', {
                 code: targetRoom.code,
                 success: false,
                 reason: 'cooldown',
-                turnsRemaining: Math.max(1, turnsRemaining),
+                roundsRemaining: Math.max(1, roundsRemaining),
                 available: false
             });
             emitForensicAbilityStatus(targetRoom, socket.id);
