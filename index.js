@@ -782,6 +782,37 @@ function registerClueDiscovery(targetRoom, roomId, player, round) {
     return changed;
 }
 
+// Undoes registerClueDiscovery's credit for a single player, but ONLY for
+// discoveries made in `round` — i.e. this same round. Called from
+// 'kill_player' the instant a Killer's victim is confirmed: if that victim
+// had investigated a room and picked up a clue earlier THIS round, the clue
+// is meant to revert to "sitting in the room, undiscovered" rather than
+// staying on the shared CLUES board, since the player who found it never
+// lived to report it. A clue found in an earlier round (or independently
+// credited to some other still-living player this round) is untouched —
+// only this victim's own `{id, round}` credit for the CURRENT round is
+// stripped, everyone else's foundBy entries on the same clue stand as-is.
+// Deliberately scoped to targetRoom.plantedEvidence only: a discovery this
+// round can't have been archived into discoveredClues yet (that only
+// happens at round roll-over, in startNewRound), so there's nothing to
+// touch there.
+// Returns true if anything actually changed (i.e. the board is worth
+// re-broadcasting), false otherwise.
+function revertClueDiscoveryForKilledPlayer(targetRoom, playerId, round) {
+    let changed = false;
+    Object.values(targetRoom.plantedEvidence || {}).forEach(entries => {
+        entries.forEach(entry => {
+            if (!entry.foundBy || entry.foundBy.length === 0) return;
+            const before = entry.foundBy.length;
+            entry.foundBy = entry.foundBy.filter(
+                finder => !(finder.id === playerId && finder.round === round)
+            );
+            if (entry.foundBy.length !== before) changed = true;
+        });
+    });
+    return changed;
+}
+
 // Flattens every discovered (foundBy.length > 0) clue across all rooms into a
 // single list for the CLUES button. Clues nobody has found yet stay hidden —
 // same principle as the mansion map itself, nothing is spoiled in advance.
@@ -3573,6 +3604,16 @@ io.on('connection', (socket) => {
         };
 
         console.log(`kill_player: room=${targetRoom.code} KILLER ${socket.id} eliminated ${target.nickname} in "${killerRoomId}"`);
+
+        // If the victim investigated a room and picked up a clue earlier
+        // THIS round, they never lived to report it — undo their credit so
+        // the clue reverts to undiscovered (see revertClueDiscoveryForKilledPlayer).
+        // A clue they found in an earlier round, or one also credited to
+        // another still-living player this round, is left alone.
+        if (revertClueDiscoveryForKilledPlayer(targetRoom, targetId, game.round)) {
+            io.to(targetRoom.id).emit('clues_board_update', { code: targetRoom.code, clues: buildCluesBoard(targetRoom) });
+            console.log(`kill_player: room=${targetRoom.code} victim ${target.nickname}'s this-round clue discovery was reverted (died before reporting it)`);
+        }
 
         // Broadcast the elimination immediately — every other isEliminated/
         // isObserver-driven bit of UI (trial eligibility, chat locks, etc.)
