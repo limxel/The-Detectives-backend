@@ -415,6 +415,40 @@ function generateForensicClue(targetRoom, killerCharacterName, body = null) {
     return { ...result };
 }
 
+// --- KILLER'S ACCIDENTAL TRACE: DYNAMIC DROP CHANCE ------------------------
+// Replaces the old flat 50% roll. The chance is now a function of two axes:
+//
+//   1) BASE (room size) — smaller lobbies get fewer kills over the course of
+//      a match, so each individual kill needs to "count" for more; larger
+//      lobbies naturally generate more kills/rounds, so the per-kill chance
+//      can start lower without starving investigators of evidence overall.
+//      5 players -> 65%, 12 players -> 30%, linear in between (-5% per player).
+//
+//   2) RAMP (kills already resolved THIS match, before the current one) —
+//      the very first kill of a match is intentionally the hardest to trace
+//      (early-game tension, nobody should be able to pin the Killer off one
+//      unlucky roll turn one). Chance then climbs steeply with every kill
+//      that follows, capping out so the endgame is always crackable
+//      regardless of lobby size. +10% per prior kill, capped at +25%.
+//
+// Final chance is clamped to [15%, 85%] so neither end of the curve is ever
+// a guarantee or an impossibility.
+function clamp(value, min, max) {
+    return Math.max(min, Math.min(max, value));
+}
+
+function getEvidenceDropChance(targetRoom) {
+    const playerCount = targetRoom.players.length;
+    // targetRoom.bodies already has the CURRENT kill pushed onto it by the
+    // time this runs (see resolve_kill), so prior kills = length - 1.
+    const priorKillCount = Math.max(0, (targetRoom.bodies || []).length - 1);
+
+    const base = clamp(90 - playerCount * 5, 25, 65);
+    const rampBonus = Math.min(priorKillCount * 10, 25);
+
+    return clamp(base + rampBonus, 15, 85) / 100;
+}
+
 function garbleCategoryValue(categories, trueValue) {
     const others = categories.filter(c => c !== trueValue);
     return others[Math.floor(Math.random() * others.length)];
@@ -3625,8 +3659,8 @@ io.on('connection', (socket) => {
         }
 
         // --- KILLER'S ACCIDENTAL TRACE ---------------------------------------
-        // On every kill, there's a flat 50% chance the Killer accidentally
-        // leaves behind one of their OWN character's 3 personal items (see
+        // On every kill, there's a chance the Killer accidentally leaves
+        // behind one of their OWN character's 3 personal items (see
         // CHARACTER_EVIDENCE) — same shape/mechanism as the Joker's deliberate
         // plant_joker_evidence, just automatic and random instead of a chosen
         // action. It's dropped into a random searchable mansion room (any
@@ -3637,8 +3671,13 @@ io.on('connection', (socket) => {
         // found, wherever it's found (see plantedEvidenceForRoom / CLUES
         // board). Only the Killer themself is told this happened, via the
         // `killerClue` field on 'kill_resolved' below.
+        //
+        // The chance is no longer a flat 50% — see getEvidenceDropChance
+        // above: it scales down for bigger lobbies and ramps up with every
+        // kill already resolved this match.
         let killerClue = null;
-        if (killerPlayer && Math.random() < 0.5) {
+        const evidenceDropChance = killerPlayer ? getEvidenceDropChance(targetRoom) : 0;
+        if (killerPlayer && Math.random() < evidenceDropChance) {
             const evidencePool = CHARACTER_EVIDENCE[killerPlayer.character] || [{ name: 'Mysterious personal item', description: 'An unidentified item with no further clues.' }];
             const clueData = evidencePool[Math.floor(Math.random() * evidencePool.length)];
             const dropCandidates = allSearchableRoomIds();
