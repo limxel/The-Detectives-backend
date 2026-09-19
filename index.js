@@ -2902,6 +2902,14 @@ io.on('connection', (socket) => {
         const targetRoom = Object.values(rooms).find(r => r.code === cleanCode);
 
         if (targetRoom) {
+            const nicknameNormalized = (nickname || '').trim().toLowerCase();
+            const wasKicked = (targetRoom.kickedPlayers || []).some(k => k.id === socket.id || (nicknameNormalized && k.nickname === nicknameNormalized));
+            if (wasKicked) {
+                console.log(`join_by_code REJECTED: ${socket.id} (${nickname}) was previously kicked from room ${targetRoom.code}`);
+                socket.emit('join_error', 'You were removed from this room by the host and cannot rejoin it.');
+                return;
+            }
+
             // Guard against duplicates: if the socket is already in the room (e.g. a
             // repeated click), don't add it a second time
             const alreadyInRoom = targetRoom.players.some(p => p.id === socket.id);
@@ -5249,6 +5257,12 @@ io.on('connection', (socket) => {
 
         const targetPlayer = targetRoom.players.find(p => p.id === targetId);
         if (!targetPlayer) return;
+
+        // Recorded by both id and nickname: a kicked player reconnecting gets a
+        // brand-new socket.id, so the nickname match is what actually stops
+        // them from just rejoining immediately under the same identity.
+        targetRoom.kickedPlayers = targetRoom.kickedPlayers || [];
+        targetRoom.kickedPlayers.push({ id: targetId, nickname: (targetPlayer.nickname || '').trim().toLowerCase() });
 
         targetRoom.players = targetRoom.players.filter(p => p.id !== targetId);
         handlePlayerLeftRoom(targetRoom, targetId);
