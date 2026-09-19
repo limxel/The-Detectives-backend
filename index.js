@@ -5227,6 +5227,54 @@ io.on('connection', (socket) => {
         }
     });
 
+    // Host-only: remove a player from the lobby before the match starts.
+    // Deliberately restricted to the pre-game lobby (no targetRoom.game yet) —
+    // once a match is running, removing a player mid-game is a much bigger
+    // can of worms (turn order, trial eligibility, role balance, etc.) that
+    // leave_room/disconnect already handle correctly on their own, so kicking
+    // is scoped to exactly the case the feature was asked for.
+    socket.on('kick_player', ({ code, targetId }) => {
+        const targetRoom = Object.values(rooms).find(r => r.code === code);
+        if (!targetRoom) return;
+
+        if (targetRoom.hostId !== socket.id) {
+            console.log('kick_player REJECTED: socket is not host', socket.id, 'expected', targetRoom.hostId);
+            return;
+        }
+        if (!targetId || targetId === socket.id) return;
+        if (targetRoom.game) {
+            console.log('kick_player REJECTED: match already in progress', targetRoom.code);
+            return;
+        }
+
+        const targetPlayer = targetRoom.players.find(p => p.id === targetId);
+        if (!targetPlayer) return;
+
+        targetRoom.players = targetRoom.players.filter(p => p.id !== targetId);
+        handlePlayerLeftRoom(targetRoom, targetId);
+
+        console.log(`Room ${targetRoom.code}: host ${socket.id} kicked ${targetId} (${targetPlayer.nickname})`);
+
+        // Tell the removed player specifically, then drop them from the
+        // socket.io room so they stop receiving further room_updated etc.
+        io.to(targetId).emit('kicked_from_room', { code: targetRoom.code });
+        io.sockets.sockets.get(targetId)?.leave(targetRoom.id);
+
+        if (targetRoom.players.length === 0) {
+            clearTurnTimer(targetRoom.id);
+            clearTrialTickTimer(targetRoom.id);
+            clearTrialTransitionTimers(targetRoom.id);
+            clearGameOverTimer(targetRoom.id);
+            delete rooms[targetRoom.id];
+            console.log(`Room ${targetRoom.code} deleted (empty)`);
+        } else {
+            logRoomState('kick_player', targetRoom);
+            io.to(targetRoom.id).emit('room_updated', roomUpdatedPayload(targetRoom));
+        }
+
+        io.emit('rooms_list', publicRoomsList());
+    });
+
     socket.on('disconnect', () => {
         console.log(`Player disconnected: ${socket.id}`);
 
